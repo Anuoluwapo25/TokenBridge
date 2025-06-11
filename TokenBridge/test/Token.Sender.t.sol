@@ -56,27 +56,35 @@ contract MockERC20 {
 }
 
 contract MockRouter {
-    struct EVM2AnyMessage {
-        bytes receiver;
-        bytes data;
-        TokenAmount[] tokenAmounts;
-        bytes extraArgs;
-        address feeToken;
-    }
+    uint256 public constant MOCK_FEE = 1e18;
     
-    struct TokenAmount {
+    struct EVMTokenAmount {
         address token;
         uint256 amount;
     }
     
-    uint256 public constant MOCK_FEE = 1e18; 
+    struct EVM2AnyMessage {
+        bytes receiver;
+        bytes data;
+        EVMTokenAmount[] tokenAmounts;
+        address feeToken;
+        bytes extraArgs;
+    }
     
     function getFee(uint64, EVM2AnyMessage memory) external pure returns (uint256) {
         return MOCK_FEE;
     }
     
-    function ccipSend(uint64, EVM2AnyMessage memory) external view returns (bytes32) {
+    function ccipSend(uint64, EVM2AnyMessage memory) external returns (bytes32) {
         return keccak256(abi.encodePacked(block.timestamp, msg.sender));
+    }
+    
+    function isChainSupported(uint64) external pure returns (bool) {
+        return true;
+    }
+    
+    function getSupportedTokens(uint64) external pure returns (address[] memory) {
+        return new address[](0);
     }
 }
 
@@ -91,8 +99,8 @@ contract CCIPTokenSenderTest is Test {
     address public user = makeAddr("user");
     
     uint64 public constant DESTINATION_CHAIN_SELECTOR = 10344971235874465080;
-    uint256 public constant TRANSFER_AMOUNT = 10e6; 
-    uint256 public constant LINK_FEE = 1e18; 
+    uint256 public constant TRANSFER_AMOUNT = 100e6;
+    uint256 public constant LINK_FEE = 1e18;
     
     function setUp() public {
         vm.startPrank(owner);
@@ -109,20 +117,40 @@ contract CCIPTokenSenderTest is Test {
         
         link.mint(user, 100e18);
         usdc.mint(user, 1000e6);
-        link.mint(address(tokenSender), LINK_FEE * 10); 
+        link.mint(address(tokenSender), LINK_FEE * 10);
         
         vm.stopPrank();
     }
     
+    function test_successfulTransfer() public {
+        vm.startPrank(user);
+        
+        usdc.approve(address(tokenSender), TRANSFER_AMOUNT);
+        
+        uint256 userBalanceBefore = usdc.balanceOf(user);
+        uint256 contractBalanceBefore = usdc.balanceOf(address(tokenSender));
+        
+        console.log("User balance before:", userBalanceBefore);
+        console.log("Contract balance before:", contractBalanceBefore);
+        
+        bytes32 messageId = tokenSender.transferTokens(receiver, TRANSFER_AMOUNT);
+        
+        console.log("Message ID:", uint256(messageId));
+        console.log("User balance after:", usdc.balanceOf(user));
+        console.log("Contract balance after:", usdc.balanceOf(address(tokenSender)));
+        
+        assertEq(usdc.balanceOf(user), userBalanceBefore - TRANSFER_AMOUNT);
+        assertEq(usdc.balanceOf(address(tokenSender)), contractBalanceBefore + TRANSFER_AMOUNT);
+        assertTrue(messageId != bytes32(0));
+        
+        vm.stopPrank();
+    }
     
     function test_revert_insufficientUSDCBalance() public {
         vm.startPrank(user);
         
         uint256 userBalance = usdc.balanceOf(user);
         uint256 excessiveAmount = userBalance + 1;
-        
-        console.log("User USDC balance:", userBalance);
-        console.log("Attempting to transfer:", excessiveAmount);
         
         usdc.approve(address(tokenSender), type(uint256).max);
         
@@ -134,10 +162,54 @@ contract CCIPTokenSenderTest is Test {
                 excessiveAmount
             )
         );
-        
         tokenSender.transferTokens(receiver, excessiveAmount);
         
         vm.stopPrank();
     }
+
+    function test_revertInsufficientLINKBalance() public {
+        vm.startPrank(owner);
+        
+        CCIPTokenSender tokenSenderNoLink = new CCIPTokenSender(
+            address(router),
+            address(link),
+            address(usdc)
+        );
+        
+        vm.stopPrank();
+        vm.startPrank(user);
+        
+        usdc.mint(user, TRANSFER_AMOUNT);
+        usdc.approve(address(tokenSenderNoLink), TRANSFER_AMOUNT);
+        
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CCIPTokenSender.CCIPTokenSender__InsufficientBalance.selector,
+                address(link),
+                0,
+                LINK_FEE
+            )
+        );
+        tokenSenderNoLink.transferTokens(receiver, TRANSFER_AMOUNT);
+        
+        vm.stopPrank();
+    }
     
+    function test_revertZeroAmount() public {
+        vm.startPrank(user);
+        usdc.approve(address(tokenSender), TRANSFER_AMOUNT);
+        
+        vm.expectRevert(CCIPTokenSender.CCIPTokenSender__InvalidAmount.selector);
+        tokenSender.transferTokens(receiver, 0);
+        vm.stopPrank();
+    }
+    
+    function test_revertZeroAddressReceiver() public {
+        vm.startPrank(user);
+        usdc.approve(address(tokenSender), TRANSFER_AMOUNT);
+        
+        vm.expectRevert(CCIPTokenSender.CCIPTokenSender__InvalidReceiver.selector);
+        tokenSender.transferTokens(address(0), TRANSFER_AMOUNT);
+        vm.stopPrank();
+    }
 }

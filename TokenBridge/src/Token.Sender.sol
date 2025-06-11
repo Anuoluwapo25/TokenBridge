@@ -1,96 +1,66 @@
 // SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
 
-pragma solidity 0.8.20;
-
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IRouterClient} from "@chainlink/src/v0.8/ccip/interfaces/IRouterClient.sol";
-
 import {Client} from "@chainlink/src/v0.8/ccip/libraries/Client.sol";
-import {IERC20} from "@chainlink/src/v0.8/vendor/openzeppelin-solidity/v4.8.3/contracts/token/ERC20/IERC20.sol";
-import {SafeERC20} from "@chainlink/src/v0.8/vendor/openzeppelin-solidity/v4.8.3/contracts/token/ERC20/utils/SafeERC20.sol";
-import {Client} from "@chainlink/src/v0.8/ccip/libraries/Client.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
-
-
-
-contract CCIPTokenSender is Ownable {
+contract CCIPTokenSender {
     using SafeERC20 for IERC20;
 
-    error CCIPTokenSender__InsufficientBalance(IERC20 token, uint256 currentBalance, uint256 requiredAmount);
-    error CCIPTokenSender__NothingToWithdraw();
+    error CCIPTokenSender__InsufficientBalance(address token, uint256 balance, uint256 amount);
+    error CCIPTokenSender__TransferFailed(address token, address from, address to, uint256 amount);
+    error CCIPTokenSender__InvalidReceiver();
+    error CCIPTokenSender__InvalidAmount();
 
-    IRouterClient private  CCIP_ROUTER;
-    IERC20 private LINK_TOKEN;
-    IERC20 private USDC_TOKEN;
-    uint64 private constant DESTINATION_CHAIN_SELECTOR = 10344971235874465080;
+    IRouterClient public immutable i_router;
+    IERC20 public immutable i_link;
+    IERC20 public immutable i_token;
 
-    event USDCBrigded (
-        bytes32 messageId,
-        uint64 indexed destinationChainSelector,
-        address indexed receiver,
-        uint256 amount,
-        uint256 ccipFee
-    );
-
-    constructor(
-        address _router,
-        address _linkToken,
-        address _usdcToken
-        ) Ownable(msg.sender) {
-            CCIP_ROUTER = IRouterClient(_router);
-            LINK_TOKEN = IERC20(_linkToken);
-            USDC_TOKEN = IERC20(_usdcToken);
+    constructor(address router, address link, address token) {
+        i_router = IRouterClient(router);
+        i_link = IERC20(link);
+        i_token = IERC20(token);
     }
 
-    function transferTokens(
-    address _receiver,
-    uint256 _amount
-) external returns (bytes32 messageId) {
-    uint256 userBalance = USDC_TOKEN.balanceOf(msg.sender);
-    if (_amount > userBalance) {
-        revert CCIPTokenSender__InsufficientBalance(
-            USDC_TOKEN,
-            userBalance,
-            _amount
-        );
-    }
+    function transferTokens(address receiver, uint256 amount) external returns (bytes32 messageId) {
+        if (receiver == address(0)) revert CCIPTokenSender__InvalidReceiver();
+        if (amount == 0) revert CCIPTokenSender__InvalidAmount();
 
-    Client.EVMTokenAmount[] memory tokenAmounts = new Client.EVMTokenAmount[](1);
-    tokenAmounts[0] = Client.EVMTokenAmount({
-        token: address(USDC_TOKEN),
-        amount: _amount
-    });
+        uint256 userBalance = i_token.balanceOf(msg.sender);
+        if (userBalance < amount) {
+            revert CCIPTokenSender__InsufficientBalance(address(i_token), userBalance, amount);
+        }
 
-    Client.EVM2AnyMessage memory message = Client.EVM2AnyMessage({
-        receiver: abi.encode(_receiver),
-        data: "",
-        tokenAmounts: tokenAmounts,
-        extraArgs: Client._argsToBytes(Client.EVMExtraArgsV1({gasLimit: 0})),
-        feeToken: address(LINK_TOKEN)
-    });
+        bool success = i_token.transferFrom(msg.sender, address(this), amount);
+        if (!success) {
+            revert CCIPTokenSender__TransferFailed(address(i_token), msg.sender, address(this), amount);
+        }
 
-    uint256 ccipFee = CCIP_ROUTER.getFee(DESTINATION_CHAIN_SELECTOR, message);
-    
-    if (ccipFee > LINK_TOKEN.balanceOf(address(this))) {
-        revert CCIPTokenSender__InsufficientBalance(
-            LINK_TOKEN,
-            LINK_TOKEN.balanceOf(address(this)),
-            ccipFee
-        );
-    }
+        Client.EVMTokenAmount[] memory tokens = new Client.EVMTokenAmount[](1);
+        tokens[0] = Client.EVMTokenAmount({
+            token: address(i_token),
+            amount: amount
+        });
 
-    LINK_TOKEN.approve(address(CCIP_ROUTER), ccipFee);
-    USDC_TOKEN.safeTransferFrom(msg.sender, address(this), _amount);
-    USDC_TOKEN.approve(address(CCIP_ROUTER), _amount);
+        Client.EVM2AnyMessage memory message = Client.EVM2AnyMessage({
+            receiver: abi.encode(receiver),
+            data: "",
+            tokenAmounts: tokens,
+            feeToken: address(i_link),
+            extraArgs: ""
+        });
 
-    messageId = CCIP_ROUTER.ccipSend(DESTINATION_CHAIN_SELECTOR, message);
-    emit USDCBrigded(messageId, DESTINATION_CHAIN_SELECTOR, _receiver, _amount, ccipFee);
-}
-    function withdrawToken(
-        address _beneficiary
-    ) public onlyOwner {
-        uint256 amount = IERC20(USDC_TOKEN).balanceOf(address(this));
-        if (amount == 0) revert CCIPTokenSender__NothingToWithdraw();
-        IERC20(USDC_TOKEN).transfer(_beneficiary, amount);
+        uint256 fee = i_router.getFee(10344971235874465080, message);
+        uint256 linkBalance = i_link.balanceOf(address(this));
+        if (linkBalance < fee) {
+            revert CCIPTokenSender__InsufficientBalance(address(i_link), linkBalance, fee);
+        }
+        
+        i_link.approve(address(i_router), fee);
+        messageId = i_router.ccipSend(10344971235874465080, message);
+
+        return messageId;
     }
 }
